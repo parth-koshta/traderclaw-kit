@@ -1,0 +1,23 @@
+# Personal: your settings, data, journal, strategy and rules never go into git. Don't remove these lines.
+/config*.json*
+!/config.example.json
+.claude/settings.local.json
+CLAUDE.local.md
+data/
+journal/
+my-strategy/*
+!my-strategy/STRATEGY.template.md
+rules/*
+!rules/README.md
+!rules/example_*.py
+tests/test_rule_*.py
+
+# Build and OS files
+__pycache__/
+*.pyc
+*.ex5
+*.log
+*.tmp
+*.lock
+.venv/
+.DS_Store

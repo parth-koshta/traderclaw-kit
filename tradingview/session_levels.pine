@@ -1,0 +1,348 @@
+//@version=6
+// TraderClaw kit: session, day and week highs/lows on TradingView, on your MT5 broker's server hours.
+// Most brokers run MT5 server time = New York time + 7 hours all year (Monday opens at 00:00 server, both sides of the
+// daylight-saving changes); set "Broker server time = New York +" below if yours differs. Sessions are set in server
+// time, so they work whatever time zone the chart shows: Tokyo 03-10, London 10-15, New York 15-24 by default, the
+// same windows as the kit's engine (traderclaw/levels.py). The day ends at server midnight (17:00 New York with the
+// default), like MT5's D1 candle, and the week runs Monday 00:00 to Friday 24:00 server, like MT5's W1 candle.
+// Shows the previous day's sessions ("Prev Tokyo high"), PDH/PDL, and today's: finished ones solid, the running one
+// dashed "(so far)" and moving with price. Each level starts at the candle that made it: amber while untaken; once price
+// trades beyond it, it stops there and turns grey dotted. Older days are removed.
+// Weeks: the previous weeks' highs and lows (PWH/PWL for last week, "Wk 26 Oct high" before it; never the current week)
+// and a dashed vertical line where each of those weeks starts, plus one where this week starts. Weekly levels are found
+// on 1h candles, so they show on any timeframe even when the chart has only a few days loaded; on charts below 1h a
+// weekly line starts at the hour that made it, and a new week's levels appear when its first hour closes.
+// Sessions need 1h or lower (a 4h candle spans two sessions), so above 1h only PDH/PDL and the weeks show.
+// Prices come from the chart's data feed, which can differ from your broker's by a little: check exact levels on MT5.
+// MIT licence. Information only, not financial advice.
+indicator("Session & weekly highs/lows (MT5 server hours)", shorttitle = "Session H/L", overlay = true, max_lines_count = 150, max_labels_count = 150)
+
+string NY_TZ = "America/New_York"
+int serverOffset = input.int(7, "Broker server time = New York +", minval = -12, maxval = 14, tooltip = "Hours. 7 for most MT5 brokers (GMT+2 in winter, GMT+3 in summer).", display = display.none)
+int SHIFT = serverOffset * 60 * 60 * 1000
+int DAY_MS = 24 * 60 * 60 * 1000
+
+string G = "Sessions (MT5 server hours)"
+int tokyoFrom = input.int(3, "Tokyo from", minval = 0, maxval = 23, group = G, inline = "t", display = display.none)
+int tokyoTo = input.int(10, "to", minval = 1, maxval = 24, group = G, inline = "t", display = display.none)
+int londonFrom = input.int(10, "London from", minval = 0, maxval = 23, group = G, inline = "l", display = display.none)
+int londonTo = input.int(15, "to", minval = 1, maxval = 24, group = G, inline = "l", display = display.none)
+int nyFrom = input.int(15, "New York from", minval = 0, maxval = 23, group = G, inline = "n", display = display.none)
+int nyTo = input.int(24, "to", minval = 1, maxval = 24, group = G, inline = "n", display = display.none)
+bool showPD = input.bool(true, "Previous day high/low (PDH/PDL)", display = display.none)
+bool showLive = input.bool(true, "Running session (so far)", display = display.none)
+string GW = "Weeks"
+bool showWeeks = input.bool(true, "Previous weeks' high/low", group = GW, display = display.none)
+int nWeeks = input.int(2, "How many previous weeks", minval = 1, maxval = 4, group = GW, display = display.none)
+bool showSeps = input.bool(true, "Week start lines", group = GW, display = display.none)
+color cSep = input.color(color.new(#787b86, 30), "Week start line", group = GW, display = display.none)
+color cUntaken = input.color(#d97706, "Untaken", display = display.none)
+color cTaken = input.color(#6b7280, "Taken", display = display.none)
+
+bool SESS_OK = timeframe.in_seconds() <= 3600
+bool DAY_OK = timeframe.in_seconds() <= 86400
+bool WEEK_OK = timeframe.in_seconds() <= 7 * 86400
+
+type Level
+    string name
+    float price
+    bool isHigh
+    int day
+    bool pd
+    bool live
+    bool taken
+    line ln
+    label lb
+    string alias = ""
+    int wstart = na      // weekly levels only: the start time of their week
+    string walias = ""   // a daily level on the same price as a weekly one carries its name ("PWL · PDL · ...")
+
+type Sess
+    string name
+    int a
+    int b
+    Level hiLv
+    Level loLv
+    bool on = false
+
+type Day
+    float hi
+    float lo
+    int hiT
+    int loT
+    bool on = false
+
+var array<Level> levels = array.new<Level>()
+
+srvHour(int t) =>
+    hour(t + SHIFT, NY_TZ)
+
+srvDay(int t) =>
+    dayofmonth(t + SHIFT, NY_TZ)
+
+srvDow(int t) =>
+    dayofweek(t + SHIFT, NY_TZ)
+
+within(int t, int a, int b) =>
+    int h = srvHour(t)
+    h >= a and h < b
+
+caption(Level lv, int today) =>
+    bool weekly = not na(lv.wstart)
+    string pre = not weekly and not lv.pd and lv.day < today ? "Prev " : ""
+    string tag = (lv.walias != "" ? lv.walias + " · " : "") + (lv.alias != "" ? lv.alias + " · " : "")
+    tag + pre + lv.name + " " + str.tostring(lv.price, format.mintick) + (lv.live ? " (so far)" : "")
+
+// A level's line always runs from its candle to 1 ms later and extends right from there: with the second point at or
+// before the first, TradingView draws the extension to the left, or straight down when both points are the same.
+newLevel(string name, float price, int t, bool isHigh, int d, bool pd, bool live) =>
+    color c = live and not showLive ? color.new(cUntaken, 100) : cUntaken
+    line ln = line.new(t, price, t + 1, price, xloc.bar_time, extend.right, c, live ? line.style_dashed : line.style_solid, 1)
+    label lb = label.new(t, price, "", xloc.bar_time, yloc.price, color.new(color.black, 100), isHigh ? label.style_label_lower_left : label.style_label_upper_left, c, size.small)
+    Level lv = Level.new(name, price, isHigh, d, pd, live, false, ln, lb)
+    lb.set_text(caption(lv, d))
+    levels.push(lv)
+    lv
+
+// Traded beyond: the line stops at that candle and turns grey dotted.
+takeLevel(Level lv, int t) =>
+    lv.taken := true
+    lv.ln.set_x2(t)
+    lv.ln.set_extend(extend.none)
+    lv.ln.set_color(cTaken)
+    lv.ln.set_style(line.style_dotted)
+    lv.lb.set_textcolor(cTaken)
+    lv.taken
+
+move(Level lv, float price, int t, int today) =>
+    lv.price := price
+    lv.ln.set_xy1(t, price)
+    lv.ln.set_xy2(t + 1, price)
+    lv.lb.set_xy(t, price)
+    lv.lb.set_text(caption(lv, today))
+    lv.price
+
+settle(Level lv, int today) =>
+    lv.live := false
+    lv.ln.set_style(line.style_solid)
+    lv.ln.set_color(cUntaken)
+    lv.lb.set_textcolor(cUntaken)
+    lv.lb.set_text(caption(lv, today))
+    lv.price
+
+finish(Sess s, int today) =>
+    s.on := false
+    settle(s.hiLv, today)
+    settle(s.loLv, today)
+    s.on
+
+step(Sess s, int today) =>
+    if within(time, s.a, s.b)
+        if not s.on
+            s.on := true
+            s.hiLv := newLevel(s.name + " high", high, time, true, today, false, true)
+            s.loLv := newLevel(s.name + " low", low, time, false, today, false, true)
+        else
+            if high > s.hiLv.price
+                move(s.hiLv, high, time, today)
+            if low < s.loLv.price
+                move(s.loLv, low, time, today)
+        if barstate.isconfirmed and not within(time_close, s.a, s.b)
+            finish(s, today)
+    else if s.on
+        finish(s, today)
+    s.on
+
+// PDH/PDL usually sit on one of the day's session extremes: then that line says both ("PDL · Prev NY low") instead of
+// two labels printing over each other.
+addPD(string name, float price, int t, bool isHigh, int d) =>
+    Level twin = na
+    for lv in levels
+        if na(lv.wstart) and not lv.pd and lv.isHigh == isHigh and lv.day == d and math.abs(lv.price - price) < syminfo.mintick / 2
+            twin := lv
+    if na(twin)
+        newLevel(name, price, t, isHigh, d, true, false)
+    else
+        twin.alias := name
+        twin.lb.set_text(caption(twin, d))
+        twin
+
+closeDay(Day dd, int d) =>
+    dd.on := false
+    if showPD
+        addPD("PDH", dd.hi, dd.hiT, true, d)
+        addPD("PDL", dd.lo, dd.loT, false, d)
+    dd.on
+
+stepDay(Day dd, int today, bool fresh) =>
+    if fresh and dd.on
+        closeDay(dd, today - 1)
+    if not dd.on
+        dd.on := true
+        dd.hi := high
+        dd.lo := low
+        dd.hiT := time
+        dd.loT := time
+    else
+        if high > dd.hi
+            dd.hi := high
+            dd.hiT := time
+        if low < dd.lo
+            dd.lo := low
+            dd.loT := time
+    if barstate.isconfirmed and srvDay(time_close) != srvDay(time)
+        closeDay(dd, today)
+    dd.on
+
+// Runs on 1h candles (or the chart's own above 1h). Slot 0 is the current week, 1-4 the weeks before it: when each
+// started, its high and low with the candle that made them, and the first candle that traded beyond each since.
+weekStats() =>
+    var array<int> st = array.new<int>(5, na)
+    var array<float> hi = array.new<float>(5, na)
+    var array<int> hiT = array.new<int>(5, na)
+    var array<float> lo = array.new<float>(5, na)
+    var array<int> loT = array.new<int>(5, na)
+    var array<int> hiK = array.new<int>(5, na)
+    var array<int> loK = array.new<int>(5, na)
+    bool newWeek = na(st.get(0)) or srvDow(time) < srvDow(time[1]) or time - time[1] >= 4 * DAY_MS
+    if newWeek
+        st.unshift(time)
+        st.pop()
+        hi.unshift(high)
+        hi.pop()
+        hiT.unshift(time)
+        hiT.pop()
+        lo.unshift(low)
+        lo.pop()
+        loT.unshift(time)
+        loT.pop()
+        hiK.unshift(int(na))
+        hiK.pop()
+        loK.unshift(int(na))
+        loK.pop()
+    else
+        if high > hi.get(0)
+            hi.set(0, high)
+            hiT.set(0, time)
+        if low < lo.get(0)
+            lo.set(0, low)
+            loT.set(0, time)
+    for k = 1 to 4
+        if not na(hi.get(k)) and na(hiK.get(k)) and high > hi.get(k)
+            hiK.set(k, time)
+        if not na(lo.get(k)) and na(loK.get(k)) and low < lo.get(k)
+            loK.set(k, time)
+    [st.get(0), st.get(1), hi.get(1), hiT.get(1), lo.get(1), loT.get(1), hiK.get(1), loK.get(1), st.get(2), hi.get(2), hiT.get(2), lo.get(2), loT.get(2), hiK.get(2), loK.get(2), st.get(3), hi.get(3), hiT.get(3), lo.get(3), loT.get(3), hiK.get(3), loK.get(3), st.get(4), hi.get(4), hiT.get(4), lo.get(4), loT.get(4), hiK.get(4), loK.get(4)]
+
+string WTF = timeframe.in_seconds() <= 3600 ? "60" : timeframe.period
+[ws0, ws1, h1, h1T, l1, l1T, h1K, l1K, ws2, h2, h2T, l2, l2T, h2K, l2K, ws3, h3, h3T, l3, l3T, h3K, l3K, ws4, h4, h4T, l4, l4T, h4K, l4K] = request.security(syminfo.tickerid, WTF, weekStats(), lookahead = barmerge.lookahead_off)
+
+// Draws week k's high and low if they aren't on the chart yet, already grey if price has traded beyond them since.
+syncWeek(int k, int ws, float h, int hT, float l, int lT, int hK, int lK, int today) =>
+    if k <= nWeeks and not na(ws) and not na(h)
+        bool have = false
+        for lv in levels
+            if lv.wstart == ws
+                have := true
+        if not have
+            Level a = newLevel("", h, hT, true, today, false, false)
+            a.wstart := ws
+            if not na(hK)
+                takeLevel(a, hK)
+            Level b = newLevel("", l, lT, false, today, false, false)
+            b.wstart := ws
+            if not na(lK)
+                takeLevel(b, lK)
+    k
+
+// Names the weekly lines (PWH/PWL for last week, "Wk 26 Oct high" before it). When a daily level sits on the same price
+// (on Mondays PWL is usually also PDL), that line carries the weekly name and the weekly label is hidden.
+refreshWeeks(int today) =>
+    for lv in levels
+        if na(lv.wstart)
+            lv.walias := ""
+    for w in levels
+        if not na(w.wstart)
+            int k = w.wstart == ws1 ? 1 : w.wstart == ws2 ? 2 : w.wstart == ws3 ? 3 : 4
+            w.name := k == 1 ? (w.isHigh ? "PWH" : "PWL") : "Wk " + str.format_time(w.wstart + SHIFT, "d MMM", NY_TZ) + (w.isHigh ? " high" : " low")
+            Level twin = na
+            for lv in levels
+                if na(lv.wstart) and not lv.live and lv.isHigh == w.isHigh and math.abs(lv.price - w.price) < syminfo.mintick / 2
+                    twin := lv
+            if na(twin)
+                w.lb.set_text(caption(w, today))
+            else
+                twin.walias := w.name
+                twin.lb.set_text(caption(twin, today))
+                w.lb.set_text("")
+    today
+
+var Sess tokyo = Sess.new("Tokyo", tokyoFrom, tokyoTo)
+var Sess london = Sess.new("London", londonFrom, londonTo)
+var Sess newYork = Sess.new("NY", nyFrom, nyTo)
+var Day dayTrack = Day.new()
+var int today = 0
+var int lastWs = na
+var array<line> seps = array.new<line>()
+
+// A new server day: yesterday's levels become "Prev", the day before goes (weekly levels stay until their week drops out).
+bool fresh = bar_index > 0 and srvDay(time) != srvDay(time[1])
+if fresh
+    today += 1
+    int n = levels.size()
+    if n > 0
+        for i = n - 1 to 0
+            Level old = levels.get(i)
+            if na(old.wstart) and old.day < today - 1
+                old.ln.delete()
+                old.lb.delete()
+                levels.remove(i)
+            else
+                old.lb.set_text(caption(old, today))
+
+// Taken first, so a level is never judged against the candle that made it. A running session's level isn't "taken".
+for lv in levels
+    if not lv.taken and not lv.live and (lv.isHigh ? high > lv.price : low < lv.price)
+        takeLevel(lv, time)
+
+if SESS_OK
+    step(tokyo, today)
+    step(london, today)
+    step(newYork, today)
+if DAY_OK
+    stepDay(dayTrack, today, fresh)    // after the sessions, so the New York level is final when PDH/PDL look for their twin
+
+// A new week: drop the week that fell out of range, add last week's high/low, redraw the week start lines.
+bool newW = WEEK_OK and not na(ws0) and (na(lastWs) or ws0 != lastWs)
+if newW
+    lastWs := ws0
+    if showWeeks
+        int keepFrom = nWeeks == 1 ? ws1 : nWeeks == 2 ? ws2 : nWeeks == 3 ? ws3 : ws4
+        int nl = levels.size()
+        if nl > 0 and not na(keepFrom)
+            for i = nl - 1 to 0
+                Level old = levels.get(i)
+                if not na(old.wstart) and old.wstart < keepFrom
+                    old.ln.delete()
+                    old.lb.delete()
+                    levels.remove(i)
+        syncWeek(1, ws1, h1, h1T, l1, l1T, h1K, l1K, today)
+        syncWeek(2, ws2, h2, h2T, l2, l2T, h2K, l2K, today)
+        syncWeek(3, ws3, h3, h3T, l3, l3T, h3K, l3K, today)
+        syncWeek(4, ws4, h4, h4T, l4, l4T, h4K, l4K, today)
+    for s in seps
+        s.delete()
+    seps.clear()
+    if showSeps
+        array<int> starts = array.from(ws0, ws1, ws2, ws3, ws4)
+        for k = 0 to nWeeks
+            int ws = starts.get(k)
+            if not na(ws)
+                seps.push(line.new(ws, close, ws, close + 10 * syminfo.mintick, xloc.bar_time, extend.both, cSep, line.style_dashed, 1))
+
+if showWeeks and (newW or fresh)
+    refreshWeeks(today)
+
+var table note = table.new(position.bottom_right, 1, 1)
+if barstate.islast and not SESS_OK
+    note.cell(0, 0, "Session H/L: sessions show on 1h or lower", text_color = cUntaken)

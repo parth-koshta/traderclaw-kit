@@ -1,0 +1,32 @@
+{
+  "export_dir": "<MT5 data folder>/MQL5/Files/traderclaw",
+  "python_cmd": "python3",
+  "symbols": ["EURUSD", "GBPUSD", "XAUUSD"],
+  "sessions": [
+    {"name": "Tokyo", "from": 3, "to": 10},
+    {"name": "London", "from": 10, "to": 15},
+    {"name": "NY", "from": 15, "to": 24}
+  ],
+  "levels": {
+    "previous_week": true,
+    "previous_day": true,
+    "previous_day_sessions": true,
+    "today_sessions": true
+  },
+  "alerts": {
+    "level_taken": true,
+    "close_after_take": true,
+    "families": ["PW", "PD", "Session"],
+    "session_open": false
+  },
+  "push": {"mt5": true, "telegram": false},
+  "journal": {
+    "enabled": true,
+    "account_labels": {},
+    "auto_review": false,
+    "review_model": "sonnet",
+    "review_budget_usd": 1.0
+  },
+  "loop_seconds": 15,
+  "stale_after_seconds": 180
+}
